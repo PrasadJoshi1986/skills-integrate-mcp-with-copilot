@@ -5,14 +5,25 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
 import os
+import secrets
 from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.environ.get("SESSION_SECRET") or secrets.token_urlsafe(32),
+    max_age=8 * 60 * 60,
+    same_site="lax",
+    https_only=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
+)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -78,6 +89,16 @@ activities = {
 }
 
 
+class StaffLogin(BaseModel):
+    username: str
+    password: str
+
+
+def require_staff(request: Request):
+    if request.session.get("is_staff") is not True:
+        raise HTTPException(status_code=401, detail="Staff login required")
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,8 +109,36 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/me")
+def get_auth_status(request: Request):
+    return {"authenticated": request.session.get("is_staff") is True}
+
+
+@app.post("/auth/login")
+def login_staff(credentials: StaffLogin, request: Request):
+    staff_username = os.environ.get("STAFF_USERNAME")
+    staff_password = os.environ.get("STAFF_PASSWORD")
+    if not staff_username or not staff_password:
+        raise HTTPException(status_code=503, detail="Staff login is not configured")
+
+    username_matches = secrets.compare_digest(credentials.username, staff_username)
+    password_matches = secrets.compare_digest(credentials.password, staff_password)
+    if not username_matches or not password_matches:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    request.session.clear()
+    request.session["is_staff"] = True
+    return {"authenticated": True}
+
+
+@app.post("/auth/logout")
+def logout_staff(request: Request):
+    request.session.clear()
+    return {"authenticated": False}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, _staff=Depends(require_staff)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +160,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, _staff=Depends(require_staff)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
